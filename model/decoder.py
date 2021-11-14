@@ -2,8 +2,8 @@ import torch
 from torch import nn
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
-from .highway import Highway
-
+from model.split.split_net_stack import SplitNet
+from model.highway import Highway
 
 __all__ = [
     "Decoder"
@@ -12,29 +12,26 @@ __all__ = [
 
 class Decoder(nn.Module):
 
-    def __init__(self, feat_size, emb_size, srnn_hidden_size, srnn_num_layers, wrnn_hidden_size, wrnn_num_layers,
-                 vocab_size, s_max, w_max, emb_dropout=0., fc_dropout=0.):
+    def __init__(self, feat_size, emb_size, wrnn_hidden_size, wrnn_num_layers, vocab_size, s_max, w_max,
+                 att_type, split_threshold, emb_dropout=0., fc_dropout=0.):
 
         super(Decoder, self).__init__()
 
         self.feat_size = feat_size
         self.emb_size = emb_size
-        self.srnn_hidden_size = srnn_hidden_size
-        self.srnn_num_layers = srnn_num_layers
-
         self.wrnn_hidden_size = wrnn_hidden_size
         self.wrnn_num_layers = wrnn_num_layers
         self.vocab_size = vocab_size
         self.s_max = s_max
         self.w_max = w_max
 
-        self.sentence_rnn = nn.LSTM(input_size=feat_size, hidden_size=srnn_hidden_size, num_layers=srnn_num_layers,
-                                    batch_first=True)
-        self.cont_stop_layer = nn.Linear(srnn_hidden_size, 2)  # 0 for Continue, 1 for stop
-        self.topic_layer = Highway(srnn_hidden_size, emb_size)
+        self.split_net = SplitNet(feat_size, s_max, att_type, split_threshold)
+        self.topic_layer = Highway(feat_size, emb_size)
 
         self.embedding_layer = nn.Embedding(vocab_size, emb_size)
         self.emb_dropout_layer = nn.Dropout(p=emb_dropout)
+
+        self.init_hidden_project_layer = Highway(emb_size, wrnn_hidden_size)
 
         self.word_rnn = nn.LSTM(input_size=emb_size, hidden_size=wrnn_hidden_size, num_layers=wrnn_num_layers,
                                 batch_first=True)
@@ -44,58 +41,60 @@ class Decoder(nn.Module):
             nn.Linear(wrnn_hidden_size + emb_size, vocab_size)  # merge structure
         )
 
-    def init_srnn_hidden(self, batch_size, device):
+    def init_wrnn_hidden(self, feature):
+        """
 
-        h0 = torch.zeros(self.srnn_num_layers, batch_size, self.srnn_hidden_size).to(device)
-        c0 = torch.zeros(self.srnn_num_layers, batch_size, self.srnn_hidden_size).to(device)
+        :param feature: (batch_size, emb_size)
+        :return:
+        """
+        feature = self.init_hidden_project_layer(feature)
+
+        h0 = feature.repeat(self.wrnn_num_layers, 1, 1)  # (wrnn_num_layers, batch_size, wrnn_hidden_size)
+        c0 = torch.zeros_like(h0)
 
         return h0, c0
 
-    def init_wrnn_hidden(self, batch_size, device):
-
-        h0 = torch.zeros(self.wrnn_num_layers, batch_size, self.wrnn_hidden_size).to(device)
-        c0 = torch.zeros(self.wrnn_num_layers, batch_size, self.wrnn_hidden_size).to(device)
-
-        return h0, c0
-
-    def generate_topics(self, visual_feat):
+    def generate_topics(self, global_feat, features, para_lengths=None, tree_labels=None):
         """Use Sentence RNN to generate s_max topic vectors
 
-        :param visual_feat: (batch_size, feat_size)
-        :return: topic_vec (batch_size, s_max, emb_size), cont_stop_unnorm (batch_size, s_max, 2)
+        :param global_feat: (batch_size, feat_size)
+        :param features: (batch_size, f_max, feat_size)
+        :param para_lengths: None or (batch_size, )
+        :param tree_labels: None or (batch_size, 2*max_len-1)
+        :return: topic_vec (batch_size, s_max, emb_size), tree_list (list[Tree]),
+                 scores (tensor) (batch_size, 2*max_len-1)
         """
 
-        batch_size = visual_feat.shape[0]
-        device = visual_feat.device
+        if self.training:
+            leaf_tensor, tree_list, scores = self.split_net(global_feat, features, para_lengths, tree_labels)
+        else:
+            leaf_tensor, tree_list, scores = self.split_net(global_feat, features)
 
-        srnn_input = visual_feat[:, None, :].expand(batch_size, self.s_max, self.feat_size)
-        h0, c0 = self.init_srnn_hidden(batch_size, device)
+        topic_vec = self.topic_layer(leaf_tensor)  # (batch_size, s_max, emb_size)
 
-        srnn_output, _ = self.sentence_rnn(srnn_input, (h0, c0))  # (batch_size, s_max, srnn_hidden_size)
+        return topic_vec, tree_list, scores
 
-        topic_vec = self.topic_layer(srnn_output)  # (batch_size, s_max, emb_size)
-        cont_stop_unnorm = self.cont_stop_layer(srnn_output)  # (batch_size, s_max, 2)
-
-        return topic_vec, cont_stop_unnorm
-
-    def forward(self, visual_feat, encoded_captions, caption_lengths):
+    def forward(self, global_feat, features, encoded_captions, caption_lengths, tree_labels):
         """
 
-        :param visual_feat: (batch_size, enc_size)
+        :param global_feat: (batch_size, feat_size)
+        :param features: (batch_size, f_max, feat_size)
         :param encoded_captions: (batch_size, s_max, w_max)
         :param caption_lengths: (batch_size, s_max)
-        :return: all_predicts (batch_size, s_max, w_max, vocab_size), con_stop_unnorm (batch_size, s_max, 2)
+        :param tree_labels: (batch_size, 2*s_max-1)
+        :return: all_predicts (batch_size, s_max, w_max, vocab_size), tree_list, scores
         """
 
-        batch_size = visual_feat.shape[0]
-        device = visual_feat.device
+        batch_size = global_feat.shape[0]
+        device = global_feat.device
 
         embeddings = self.embedding_layer(encoded_captions)  # (batch_size, s_max, w_max, embed_size)
         embeddings = self.emb_dropout_layer(embeddings)
 
         # === Sentence RNN Part ====
 
-        topic_vec, cont_stop_unnorm = self.generate_topics(visual_feat)
+        topic_vec, tree_list, scores = self.generate_topics(global_feat, features, (caption_lengths > 0).sum(1),
+                                                            tree_labels)
 
         # === Word RNN Part ====
 
@@ -113,7 +112,7 @@ class Decoder(nn.Module):
             seq_len = caption_lengths[valid_batch_ind, i]  # (valid_batch_size, )
 
             wrnn_input_pps = pack_padded_sequence(wrnn_input, lengths=seq_len, batch_first=True, enforce_sorted=False)
-            h0, c0 = self.init_wrnn_hidden(valid_batch_size, device)
+            h0, c0 = self.init_wrnn_hidden(topic_vec[valid_batch_ind, i])
 
             wrnn_output_pps, _ = self.word_rnn(wrnn_input_pps, (h0, c0))
 
@@ -128,4 +127,4 @@ class Decoder(nn.Module):
 
             all_predicts[valid_batch_ind, i] = predicts
 
-        return all_predicts, cont_stop_unnorm
+        return all_predicts, tree_list, scores

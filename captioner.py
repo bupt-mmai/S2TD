@@ -1,5 +1,7 @@
 import torch
 
+from treelib import Tree
+
 from model.encoder import Encoder
 from model.decoder import Decoder
 
@@ -7,6 +9,17 @@ __all__ = [
     "Captioner"
 ]
 
+
+class SentenceTree(object):
+
+    def __init__(self, sent, score, score_att):
+
+        self.sent = sent
+        self.score = score
+        self.score_att = score_att
+
+        score_top_5, index_top_5 =  torch.tensor(score_att).topk(5)
+        self.score_att_top_5 = str(index_top_5.tolist()) + '-->' + '/'.join('{:.3f}'.format(s) for s in score_top_5.tolist())
 
 class Captioner(object):
 
@@ -32,7 +45,6 @@ class Captioner(object):
     @torch.no_grad()
     def describe_feat(self, feat_input, feat_src='densecap', decode='beam', beam_size=2, verbose=True):
 
-        assert feat_src in {'densecap', 'any'}, "feat_src is either 'densecap' or 'any'."
         assert decode in {'beam', 'greedy', 'greedy_with_penalty'}
 
         paragraph = list()
@@ -41,21 +53,13 @@ class Captioner(object):
 
         if feat_src == 'densecap':
             assert feat_input.shape == (1, self.encoder.f_max, self.encoder.input_size), "wrong input shape"
-            enc_output = self.encoder(feat_input.to(self.device))  # (1, project_size)
-        else:  # any tensor with size (1, project_size)
-            assert feat_input.shape == (1, self.decoder.feat_size), "wrong input shape"
-            enc_output = feat_input.to(self.device)  # (1, project_size)
-
-        topic_vec, cont_stop = self.decoder.generate_topics(enc_output)
-        # topic_vec (1, s_max, emb_size)
-        # cont_stop (1, s_max, 2)
-
-        cont_stop_flag = torch.log_softmax(cont_stop.squeeze(0), dim=-1).argmax(dim=-1)  # (s_max,)
-        cont_stop_flag = torch.where(cont_stop_flag==1)[0]
-        if cont_stop_flag.nelement() == 0:
-            N = self.decoder.s_max
+            global_feat, features = self.encoder(feat_input.to(self.device))
         else:
-            N = torch.min(cont_stop_flag).item() + 1 # 1-for stop
+            raise AssertionError('Not support yet')
+
+        topic_vec, tree_list, tree_scores = self.decoder.generate_topics(global_feat, features)
+        # topic_vec (1, s_max, emb_size)
+        N = len(tree_list[0].leaves())
 
         if verbose:
             print('prepare to generate {} sentences by using {} ...'.format(N, decode))
@@ -68,20 +72,50 @@ class Captioner(object):
             trigrams = None
 
         for i in range(N):
-            h0, c0 = self.decoder.init_wrnn_hidden(1, self.device)  # (wrnn_num_layers, 1, wrnn_hidden_size)
+            h0, c0 = self.decoder.init_wrnn_hidden(topic_vec[:, i, :]) # (srnn_num_layers, 1, wrnn_hidden_size)
 
             if decode == 'beam':
                 best_sent, cands, scores = self.beam_search(topic_vec[:, i, :], beam_size, h0, c0)
             else:
                 best_sent = self.greedy_search(topic_vec[:, i, :], h0, c0, trigrams)
-                cands = None
-                scores = None
 
             paragraph.append(best_sent)
             all_cands.append(cands)
             all_scores.append(scores)
 
-        return paragraph, all_cands, all_scores
+        return paragraph, all_cands, all_scores, tree_scores[0], tree_list[0]
+
+    @torch.no_grad()
+    def get_sentence_tree(self, feat_input, decode='greedy', beam_size=2, verbose=True):
+
+        assert feat_input.shape == (1, self.encoder.f_max, self.encoder.input_size), "wrong input shape"
+        global_feat, features = self.encoder(feat_input.to(self.device))
+
+        _, tree_list, scores, tree_tensor = self.decoder.split_net(global_feat, features, return_tree_tensor=True)
+
+        topic_vec = self.decoder.topic_layer(tree_tensor[:, :, :])  # (1, 2*s_max-1, emb_size)
+        sentence_tree = Tree(tree_list[0], deep=True)
+
+        N = len(tree_list[0].all_nodes())
+
+        if verbose:
+            print('prepare to generate {} sentences of tree by using {} ...'.format(N, decode))
+            if decode=='beam':
+                print('using beam size {} ...'.format(beam_size))
+
+        for j, i in enumerate(tree_list[0].expand_tree(mode=1, key=lambda n: n.identifier)):
+
+            # get attention score
+            _, att_score = self.decoder.split_net.split_attention(features,tree_tensor[:, i, :])
+
+            h0, c0 = self.decoder.init_wrnn_hidden(topic_vec[:, i, :]) # (srnn_num_layers, 1, wrnn_hidden_size)
+
+            best_sent = self.greedy_search(topic_vec[:, i, :], h0, c0)
+
+            sentence_tree[i].data = SentenceTree(' '.join(w for w in best_sent if w not in {'<bos>', '<eos>', '<pad>'}),
+                                                 scores[0, j].item(), att_score[0].cpu().numpy())
+
+        return sentence_tree, tree_tensor[0]
 
     @torch.no_grad()
     def beam_search(self, topic_vec, beam_size, h0, c0, length_penalty=0.7):

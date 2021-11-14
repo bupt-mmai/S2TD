@@ -48,13 +48,13 @@ def load_model(model_checkpoint_path, args):
 
     decoder = Decoder(feat_size=args['feat_size'],
                       emb_size=args['emb_size'],
-                      srnn_hidden_size=args['srnn_hidden_size'],
-                      srnn_num_layers=args['srnn_num_layers'],
                       wrnn_hidden_size=args['wrnn_hidden_size'],
                       wrnn_num_layers=args['wrnn_num_layers'],
                       vocab_size=args['vocab_size'],
                       s_max=args['s_max'],
-                      w_max=args['w_max']-1,
+                      w_max=args['w_max']-1,  # <bos> is not the generated target of decoder
+                      att_type=args['att_type'],
+                      split_threshold=args['split_threshold'],
                       emb_dropout=args['emb_dropout'],
                       fc_dropout=args['fc_dropout'])
 
@@ -78,7 +78,7 @@ def quantity_evaluate(encoder, decoder, word2idx, dataset, args, device, decode,
     cap = Captioner(encoder, decoder, word2idx, device)
 
     eval_loader = DataLoaderPFG(CaptionDataset(args['mapping_file_path'], args['visual_features_path'],
-                                                args['encoded_paragraphs_path'], dataset),
+                                                args['encoded_paragraphs_path'], args['tree_labels_path'], dataset),
                                 batch_size=1, shuffle=False, num_workers=1, pin_memory=True)
 
     if not mappings:
@@ -86,23 +86,27 @@ def quantity_evaluate(encoder, decoder, word2idx, dataset, args, device, decode,
 
     all_candidates = list()
     lengths = list()
-    for i, (feats, encoded_caps, cap_lens) in enumerate(eval_loader):
+    for i, (_, feats, encoded_caps, cap_lens, _) in enumerate(eval_loader):
 
         feats = feats.to(device)
 
-        best_paragraph, _, _ = cap.describe_feat(feats, feat_src='densecap', decode=decode, beam_size=beam_size,
-                                                 verbose=False)
+        best_paragraph, _, _, tree_scores, tree = cap.describe_feat(feats, feat_src='densecap',
+                                                                        decode=decode, beam_size=beam_size,
+                                                                        verbose=False)
 
         candidate_para = list()
         for sent in best_paragraph:
             candidate_para.extend(w for w in sent if w not in {'<bos>', '<eos>', '<pad>'})
-            candidate_para.append('.')
 
         all_candidates.append(' '.join(candidate_para))
         lengths.append(len(best_paragraph))
 
-        if verbose and i % 500 == 0:
-            print('{}/{}'.format(i, len(eval_loader)))
+        if i % 500 == 0:
+            print('>>> {}/{}'.format(i, len(eval_loader)))
+            print('leaf_scores')
+            print(tree_scores)
+            print('tree structure')
+            tree.show()
             print('paragraph')
             for sent in best_paragraph:
                 print(' '.join(sent))
@@ -133,6 +137,43 @@ def quantity_evaluate(encoder, decoder, word2idx, dataset, args, device, decode,
     return metrics
 
 
+@torch.no_grad()
+def tree_evaluate(encoder, decoder, word2idx, dataset, args, device, decode, model_config_path, mappings,
+                  beam_size=None):
+
+    global nlgeval
+
+    encoder.eval()
+    decoder.eval()
+
+    cap = Captioner(encoder, decoder, word2idx, device)
+
+    eval_loader = DataLoaderPFG(CaptionDataset(args['mapping_file_path'], args['visual_features_path'],
+                                                args['encoded_paragraphs_path'], args['tree_labels_path'], dataset),
+                                batch_size=1, shuffle=False, num_workers=1, pin_memory=True)
+
+    tree_dict = dict()
+    for i, (_, feats, encoded_caps, cap_lens, _) in enumerate(eval_loader):
+
+        feats = feats.to(device)
+
+        tree, tree_tensor = cap.get_sentence_tree(feats, decode=decode, beam_size=beam_size, verbose=False)
+
+        if i % 500 == 0:
+            print('>>> {}/{}'.format(i, len(eval_loader)))
+            print(tree_tensor.shape)
+            print(tree_tensor)
+            tree.show(key=lambda n: n.identifier, data_property='sent')
+            tree.show(key=lambda n: n.identifier, data_property='score')
+
+        tree_dict[mappings['gid2iid'][mappings['gid_split_dict'][dataset][i]]] = tree
+
+
+    with open(os.path.join(model_config_path, 'sentence_tree.pkl'), 'wb') as f:
+        pickle.dump(tree_dict, f)
+
+
+
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
@@ -146,6 +187,7 @@ if __name__ == '__main__':
                         help="beam size of beam search")
     parser.add_argument("--model_name", type=str, help="model name")
     parser.add_argument("--model_check_point", type=str, help="model checkpoint path")
+    parser.add_argument("--tree", action='store_true', help='eval or generate sentence tree')
     args = parser.parse_args()
 
     config_path = args.config_path
@@ -168,5 +210,9 @@ if __name__ == '__main__':
 
     print('decode type {}'.format(decode))
 
-    quantity_evaluate(encoder, decoder, word2idx, dataset, config_args, device, decode, beam_size, True,
-                      os.path.join(config_path, model_name), mappings, is_save_file=True)
+    if args.tree:
+        tree_evaluate(encoder, decoder, word2idx, dataset, config_args, device, decode,
+                      os.path.join(config_path, model_name), mappings, beam_size)
+    else:
+        quantity_evaluate(encoder, decoder, word2idx, dataset, config_args, device, decode, beam_size, True,
+                          os.path.join(config_path, model_name), mappings, is_save_file=True)

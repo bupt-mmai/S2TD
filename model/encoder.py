@@ -21,6 +21,7 @@ class Encoder(nn.Module):
 
     def forward(self, input_):
 
-        encoder_output, _ = self.project_layer(input_).max(dim=1)  # (batch_size, project_size)
+        features = self.project_layer(input_)
+        global_feat = features.max(dim=1)[0]  # (batch_size, output_size)
 
-        return encoder_output
+        return global_feat, features

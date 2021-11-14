@@ -6,8 +6,9 @@ from datetime import datetime
 import torch
 import numpy as np
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pack_padded_sequence
 from torch.nn.utils.clip_grad import clip_grad_norm_
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import ReduceLROnPlateau, StepLR
 
 from model.encoder import Encoder
 from model.decoder import Decoder
@@ -16,7 +17,7 @@ from utils.DataLoaderPFG import DataLoaderPFG
 from torch.utils.tensorboard import SummaryWriter
 from captioner import Captioner
 from evaluate import quantity_evaluate
-
+from utils.clustering import cluster_results_to_tree
 
 torch.backends.cudnn.benchmark = True
 np.random.seed(42)
@@ -27,15 +28,15 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MAX_EPOCHS = 200
 USE_CONFIG_JSON = False  # whether to use the predefined configurations
 USE_TB = False
-TB_PATH = './runs_rh'
+TB_PATH = './runs'
 CONFIG_PATH = './model_params'
 MODEL_NAME = 'debug'
 
-VISUAL_FEATURES_PATH = './data/cleaned/densecap_image_features_f_max_50_f_size_4096.h5'
-# VISUAL_FEATURES_PATH = '/data/bu36/parabu_att' # if you use BottomUp features & do not forget to change CaptionDataset 
+VISUAL_FEATURES_PATH = '/data/bu36/parabu_att'
 ENCODED_PARAGRAPHS_PATH = './data/cleaned/encoded_paragraphs_s_{}_{}_w_{}_{}.h5'
 MAPPING_FILE_PATH = './data/cleaned/mappings.pkl'
 WORD2IDX_PATH = './data/cleaned/word2idx_s_min_{}_w_min_{}.pkl'
+TREE_LABELS_PATH = './data/cleaned/tree_labels_stack_s_{}_{}_w_{}_{}.pkl'
 
 VAL_BEAM_SIZE = 1
 VAL_DECODE_TYPE = 'beam'
@@ -53,19 +54,21 @@ def set_args():
         word2idx = pickle.load(open(args['word2idx_path'], 'rb'))
     else:
         # Encoder settings
-        args['input_size'] = 4096
+        args['input_size'] = 2048
         args['output_size'] = 1024
-        args['f_max'] = 50  # fixed
+        args['f_max'] = 36  # fixed
 
         # Decoder settings
         args['feat_size'] = args['output_size']
         args['emb_size'] = 512
-        args['srnn_hidden_size'] = 1024
-        args['srnn_num_layers'] = 1
         args['wrnn_hidden_size'] = 512
         args['wrnn_num_layers'] = 2
         args['emb_dropout'] = 0.5
         args['fc_dropout'] = 0.5
+
+        # Split settings
+        args['att_type'] = 'add'  # 'add' or 'scaled_dot'
+        args['split_threshold'] = 0.3
 
         # Input files settings
         args['s_min'] = 3
@@ -78,12 +81,13 @@ def set_args():
                                                                          args['w_min'], args['w_max'])
         args['mapping_file_path'] = MAPPING_FILE_PATH
         args['word2idx_path'] = WORD2IDX_PATH.format(args['s_min'], args['w_min'])
+        args['tree_labels_path'] = TREE_LABELS_PATH.format(args['s_min'], args['s_max'], args['w_min'], args['w_max'])
 
         word2idx = pickle.load(open(args['word2idx_path'], 'rb'))
         args['vocab_size'] = len(word2idx)
 
         # Training Settings
-        args['sent_weight'] = 5.
+        args['sent_weight'] = 1.
         args['word_weight'] = 1.
         args['lr'] = 5e-4
         args['batch_size'] = 16
@@ -112,25 +116,6 @@ def save_model(encoder, decoder, epoch, metrics_on_val):
     torch.save(state, filename)
 
 
-def compute_sent_loss(cap_lens, cont_stop_preds):
-    """
-
-    :param cap_lens: (tensor) (batch_size, s_max)
-    :param cont_stop_preds: (tensor) (batch_size, s_max, 2)
-    :return: sentence loss (tensor)
-    """
-    batch_size = cap_lens.shape[0]
-
-    para_lens = (cap_lens > 0).sum(dim=-1)
-    con_stop_tags = (cap_lens <= 0).type(torch.long) * -1  # 0 for continue, 1 for stop, -1 for ignore
-    con_stop_tags[torch.arange(batch_size), para_lens - 1] = torch.ones(batch_size, dtype=torch.long).to(device)
-
-    cont_stop_preds = cont_stop_preds.view(-1, cont_stop_preds.shape[-1])
-    con_stop_tags = con_stop_tags.view(-1)
-
-    return F.cross_entropy(cont_stop_preds, con_stop_tags, ignore_index=-1)
-
-
 def compute_word_loss(caps_gt, caps_preds, ignore_index):
     """
 
@@ -145,6 +130,21 @@ def compute_word_loss(caps_gt, caps_preds, ignore_index):
     return F.cross_entropy(caps_preds, caps_tags, ignore_index=ignore_index)
 
 
+def compute_tree_loss(scores, tree_labels, lengths, margin):
+    """
+
+    :param scores: (tensor) (batch_size, 2*max_len-1)
+    :param tree_labels: (tensor) (batch_size, 2*max_len-1)
+    :param lengths: (tensor) (batch_size,)
+    :param margin: (float)
+    :return: tree loss (tensor)
+    """
+    pos_score = scores.masked_select(tree_labels == 1).clamp(min=0)
+    neg_score = (margin - scores.masked_select(tree_labels == 0)).clamp(min=0)
+
+    return (pos_score.sum() + neg_score.sum()) / (pos_score.shape[0] + neg_score.shape[0])
+
+
 def train(args, word2idx):
 
     print('Model {} start training...'.format(MODEL_NAME))
@@ -155,13 +155,13 @@ def train(args, word2idx):
 
     decoder = Decoder(feat_size=args['feat_size'],
                       emb_size=args['emb_size'],
-                      srnn_hidden_size=args['srnn_hidden_size'],
-                      srnn_num_layers=args['srnn_num_layers'],
                       wrnn_hidden_size=args['wrnn_hidden_size'],
                       wrnn_num_layers=args['wrnn_num_layers'],
                       vocab_size=args['vocab_size'],
                       s_max=args['s_max'],
                       w_max=args['w_max']-1,  # <bos> is not the generated target of decoder
+                      att_type=args['att_type'],
+                      split_threshold=args['split_threshold'],
                       emb_dropout=args['emb_dropout'],
                       fc_dropout=args['fc_dropout'])
 
@@ -176,7 +176,7 @@ def train(args, word2idx):
     scheduler = StepLR(optimizer, step_size=args['modified_after_epochs'], gamma=args['modified_lr_ratio'])
 
     train_loader = DataLoaderPFG(CaptionDataset(args['mapping_file_path'], args['visual_features_path'],
-                                                args['encoded_paragraphs_path'], 'train'),
+                                                args['encoded_paragraphs_path'], args['tree_labels_path'], 'train'),
                                  batch_size=args['batch_size'], shuffle=True, num_workers=4, pin_memory=True)
 
     # use tensorboard to track the loss
@@ -191,7 +191,7 @@ def train(args, word2idx):
 
     for epoch in range(MAX_EPOCHS):
 
-        for batch, (feats, encoded_caps, cap_lens) in enumerate(train_loader):
+        for batch, (gids, feats, encoded_caps, cap_lens, tree_labels) in enumerate(train_loader):
 
             encoder.train()
             decoder.train()
@@ -199,14 +199,17 @@ def train(args, word2idx):
             feats = feats.to(device)
             encoded_caps = encoded_caps.to(device)
             cap_lens = cap_lens.to(device)
+            tree_labels = tree_labels.to(device)
 
             optimizer.zero_grad()
 
             # === forward ====
-            encoder_output = encoder(feats)
-            all_predicts, con_stop_unnorm = decoder(encoder_output, encoded_caps[:, :, :-1], cap_lens-1)
+            global_feat, features = encoder(feats)
+            all_predicts, tree_list, scores = decoder(global_feat, features, encoded_caps[:, :, :-1], cap_lens-1,
+                                                      tree_labels)
 
-            cont_stop_loss = compute_sent_loss(cap_lens-1, con_stop_unnorm) * args['sent_weight']
+            cont_stop_loss = compute_tree_loss(scores, tree_labels, 2 * (cap_lens > 0).sum(1) - 1,
+                                               args['split_threshold']) * args['sent_weight']
             word_loss = compute_word_loss(encoded_caps[:, :, 1:], all_predicts, word2idx['<pad>']) * args['word_weight']
 
             # === calculate losses and summarize ====
@@ -217,6 +220,73 @@ def train(args, word2idx):
                 writer.add_scalar('batch_loss/total', total_loss.item(), iter_counter)
                 writer.add_scalar('batch_loss/cont_stop', cont_stop_loss.item(), iter_counter)
                 writer.add_scalar('batch_loss/word', word_loss.item(), iter_counter)
+
+            if iter_counter % 500 == 0:
+
+                encoder.eval()
+                decoder.eval()
+
+                print('quick quality check at iter {}'.format(iter_counter))
+                # === quick check random image===
+                sample_idx = np.random.randint(feats.shape[0])
+
+                print('\n============')
+                print('>>>> gid {}'.format(gids[sample_idx]))
+                cap = Captioner(encoder, decoder, word2idx, device)
+                paragraph, all_cands, all_scores, tree_scores, tree = cap.describe_feat(feats[sample_idx].unsqueeze(0),
+                                                                                        feat_src='densecap',
+                                                                                        decode=VAL_DECODE_TYPE,
+                                                                                        beam_size=VAL_BEAM_SIZE)
+                sentence_tree, _ = cap.get_sentence_tree(feats[sample_idx].unsqueeze(0), decode=VAL_DECODE_TYPE,
+                                                         beam_size=VAL_BEAM_SIZE)
+
+                print('>>>> ground truth paragraph')
+                for sent in encoded_caps[sample_idx].tolist():  # (1, s_max, w_max)
+                    print(' '.join(cap.idx2word[idx] for idx in sent if idx != word2idx['<pad>']))
+                print()
+
+                print('>>>> candidate paragraph by {}'.format(VAL_DECODE_TYPE))
+                for sent in paragraph:
+                    print(sent)
+                print()
+
+                print('>>>> candidate paragraph by true input')
+
+                for sent_i, sent in enumerate(all_predicts[sample_idx].argmax(-1).tolist()):
+                    print(' '.join(cap.idx2word[w] for c, w in enumerate(sent)
+                                   if w != word2idx['<pad>'] and c < cap_lens[sample_idx][sent_i]-1))
+                print('============\n')
+
+                if VAL_DECODE_TYPE == 'beam' and VAL_BEAM_SIZE > 1:
+                    print('>>>> different choices in beam search')
+                    cap.output_cands_with_scores(all_cands, all_scores)
+                    print()
+
+                print('>>>> tree structures', sample_idx)
+                print('[ground truth structure]')
+                tree_label_data = train_loader.dataset.tree_labels[gids[sample_idx]]
+                for sent_i, sent in enumerate(tree_label_data['sentences']):
+                    print('{}: {}'.format(sent_i, sent))
+                print('label: ', tree_label_data['label'])
+                cluster_results_to_tree(tree_label_data['cluster_results']).show(key=lambda n: n.data.order)
+
+                print('[during training]')
+                tree_list[sample_idx].show()
+
+                print('\n[during evaluating]')
+                tree.show()
+                print(tree_scores)
+
+                print('\n[sentence tree]')
+                sentence_tree.show(key=lambda n: n.identifier, data_property='sent')
+
+                print('\n[attention top 5 areas]')
+                sentence_tree.show(key=lambda n: n.identifier, data_property='score_att_top_5')
+
+                print()
+
+                encoder.train()
+                decoder.train()
 
             # === backward ====
             total_loss.backward()
@@ -230,52 +300,8 @@ def train(args, word2idx):
                                                                                                         batch,
                                                                                                         total_loss.item(),
                                                                                                         cont_stop_loss.item(),
-                                                                                                        word_loss.item()
+                                                                                                        word_loss.item(),
                                                                                                         ))
-
-            if iter_counter % 500 == 0:
-
-                encoder.eval()
-                decoder.eval()
-
-                print('quick quality check at iter {}'.format(iter_counter))
-                # === quick check random image===
-                sample_idx = np.random.randint(feats.shape[0])
-
-                print('\n============')
-                print('>>>> sample_idx {}'.format(sample_idx))
-                cap = Captioner(encoder, decoder, word2idx, device)
-                paragraph, all_cands, all_scores = cap.describe_feat(feats[sample_idx].unsqueeze(0), feat_src='densecap',
-                                                                     decode=VAL_DECODE_TYPE, beam_size=VAL_BEAM_SIZE)
-
-                print('>>>> ground truth paragraph')
-                for sent in encoded_caps[sample_idx].tolist():  # (1, s_max, w_max)
-                    print(' '.join(cap.idx2word[idx] for idx in sent if idx != word2idx['<pad>']))
-                print()
-
-                print('>>>> candidate paragraph by {}'.format(VAL_DECODE_TYPE))
-                for sent in paragraph:
-                    print(sent)
-                print()
-
-                if VAL_DECODE_TYPE == 'beam' and VAL_BEAM_SIZE > 1:
-                    print('>>>> different choices in beam search')
-                    cap.output_cands_with_scores(all_cands, all_scores)
-                    print()
-
-                print('>>>> con_stop_unnorm', con_stop_unnorm[sample_idx])
-                print()
-
-                print('>>>> candidate paragraph by true input')
-
-                for sent_i, sent in enumerate(all_predicts[sample_idx].argmax(-1).tolist()):
-                    print(' '.join(cap.idx2word[w] for c, w in enumerate(sent)
-                                   if w != word2idx['<pad>'] and c < cap_lens[sample_idx][sent_i]-1))
-                print('============\n')
-
-                encoder.train()
-                decoder.train()
-
             iter_counter += 1
 
         # === validate on val set ====
